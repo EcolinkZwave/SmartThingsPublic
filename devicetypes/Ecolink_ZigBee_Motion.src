@@ -1,0 +1,233 @@
+/*
+ *  Copyright 2016 SmartThings
+ *
+ *  Licensed under the Apache License, Version 2.0 (the "License"); you may not
+ *  use this file except in compliance with the License. You may obtain a copy
+ *  of the License at:
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ *  Unless required by applicable law or agreed to in writing, software
+ *  distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+ *  WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+ *  License for the specific language governing permissions and limitations
+ *  under the License.
+ */
+import physicalgraph.zigbee.clusters.iaszone.ZoneStatus
+
+metadata {
+	definition(name: "Ecolink ZigBee Motion Sensor", namespace: "Ecolink", author: "Ecolink") {
+		capability "Motion Sensor"
+		capability "Configuration"
+		capability "Battery"
+		capability "Temperature Measurement"
+		capability "Refresh"
+		capability "Health Check"
+		capability "Sensor"
+
+		command "enrollResponse"
+        
+        attribute "tamper", "enum", ["detected", "clear"]
+
+		//fingerprints
+        //fingerprint inClusters: "0000,0001,0003,0020,0402,0500,0B05", outClusters: "0019", manufacturer: "Universal Electronics Inc", model: "URC4470BC0-X-R"//, deviceJoinName: "UEI Motion"
+        fingerprint inClusters: "0000,0001,0003,0020,0402,0500,0B05", outClusters: "0019", manufacturer: "Ecolink", model: "PIRZB1-ECO"//, deviceJoinName: "Ecolink Motion"
+
+	}
+
+	simulator {
+		status "active": "zone report :: type: 19 value: 0031"
+		status "inactive": "zone report :: type: 19 value: 0030"
+	}
+
+	tiles(scale: 2) {
+		multiAttributeTile(name: "motion", type: "generic", width: 6, height: 4) {
+			tileAttribute("device.motion", key: "PRIMARY_CONTROL") {
+				attributeState "active", label: 'motion', icon: "st.motion.motion.active", backgroundColor: "#FB902C"
+				attributeState "inactive", label: 'no motion', icon: "st.motion.motion.inactive", backgroundColor: "#00A0DC"
+			}
+		}
+		valueTile("temperature", "device.temperature", width: 2, height: 2) {
+			state("temperature", label: '${currentValue}°', unit: "F",
+					backgroundColors: [
+							[value: 31, color: "#153591"],
+							[value: 44, color: "#1e9cbb"],
+							[value: 59, color: "#90d2a7"],
+							[value: 74, color: "#44b621"],
+							[value: 84, color: "#f1d801"],
+							[value: 95, color: "#d04e00"],
+							[value: 96, color: "#bc2323"]
+					]
+			)
+		}
+		valueTile("battery", "device.battery", decoration: "ring", inactiveLabel: false, width: 2, height: 2) {
+			state "battery", label: '${currentValue}% battery', unit: "",
+            backgroundColors: [
+							[value: 25, color: "#FF0000"],
+							[value: 74, color: "#FBFB09"],
+							[value: 96, color: "#44b621"]
+					]
+		}       
+		standardTile("refresh", "device.refresh", inactiveLabel: false, decoration: "flat", width: 2, height: 2) {
+			state "default", action: "refresh.refresh", icon: "st.secondary.refresh"
+		}
+
+		main(["motion", "temperature"])
+		details(["motion", "temperature", "battery", "refresh"])
+	}
+}
+
+def parse(String description) {
+	log.debug "description: $description"
+	Map map = zigbee.getEvent(description)
+	if (!map) {
+		if (description?.startsWith('zone status')) {
+			map = parseIasMessage(description)
+		} 
+        else {
+			Map descMap = zigbee.parseDescriptionAsMap(description)
+			if (descMap?.clusterInt == 0x0001 && descMap.commandInt != 0x07 && descMap?.value) {
+				map = getBatteryResult(Integer.parseInt(descMap.value, 16))
+			} 
+            else if (descMap?.clusterInt == zigbee.TEMPERATURE_MEASUREMENT_CLUSTER && descMap.commandInt == 0x07) {
+				if (descMap.data[0] == "00") {
+					log.debug "TEMP REPORTING CONFIG RESPONSE: $descMap"
+					sendEvent(name: "checkInterval", value: 60 * 12, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
+				} 
+                else {
+					log.warn "TEMP REPORTING CONFIG FAILED- error code: ${descMap.data[0]}"
+				}
+			} 
+            else if (descMap.clusterInt == 0x0406 && descMap.attrInt == 0x0000) {
+				def value = descMap.value.endsWith("01") ? "active" : "inactive"
+				log.debug "Doing a read attr motion event"
+				map = getMotionResult(value)
+			}
+		}
+	} else if (map.name == "temperature") {
+		if (tempOffset) {
+			map.value = (int) map.value + (int) tempOffset
+		}
+		map.descriptionText = temperatureScale == 'C' ? '{{ device.displayName }} was {{ value }}°C' : '{{ device.displayName }} was {{ value }}°F'
+		map.translatable = true
+	}
+
+	log.debug "Parse returned $map"
+	def result = map ? createEvent(map) : [:]
+
+	if (description?.startsWith('enroll request')) {
+		List cmds = zigbee.enrollResponse()
+		log.debug "enroll response: ${cmds}"
+		result = cmds?.collect { new physicalgraph.device.HubAction(it) }
+	}
+	return result
+}
+
+private Map parseIasMessage(String description) {
+	ZoneStatus zs = zigbee.parseZoneStatus(description)
+
+	//check for tamper bit, send message to log if tampered/tamper cleared
+    if(zs.tamper != 0)
+    {
+    	sendEvent(name: "tamper", value: "detected")
+    }
+    else if(zs.tamper != 1)
+    {
+    	sendEvent(name: "tamper", value: "clear")
+    }
+    
+    // Some sensor models that use this DTH use alarm1 and some use alarm2 to signify motion
+	return (zs.isAlarm1Set() || zs.isAlarm2Set()) ? getMotionResult('active') : getMotionResult('inactive')
+}
+
+private Map getBatteryResult(rawValue) {
+	log.debug "Battery rawValue = ${rawValue}"
+	def linkText = getLinkText(device)
+
+	def result = [:]
+
+	def volts = rawValue / 10
+
+	if (!(rawValue == 0 || rawValue == 255)) {
+		result.name = 'battery'
+		result.translatable = true
+		result.descriptionText = "{{ device.displayName }} battery was {{ value }}%"
+
+        def minVolts = 2.2
+        def maxVolts = 3.0
+        def pct = (volts - minVolts) / (maxVolts - minVolts)
+        def roundedPct = Math.round(pct * 100)
+        if (roundedPct <= 0)
+        roundedPct = 1
+        result.value = Math.min(100, roundedPct)
+        
+        //alert end user of low battery 
+        if(result.value <= 40)
+        {
+        	result.descriptionText = "$device.displayName low battery alert!"
+        }
+	}
+    //if we get 0 its because the sensor didnt read the voltage prior to learning in. Assume battery is 100%
+    else if(rawValue == 0)
+    {
+    	result.name = 'battery'
+		result.translatable = true
+		result.descriptionText = "{{ device.displayName }} battery was {{ value }}%"
+        result.value = 100
+    }
+
+	return result
+}
+
+private Map getMotionResult(value) {
+	log.debug 'motion'
+	String descriptionText = value == 'active' ? "{{ device.displayName }} detected motion" : "{{ device.displayName }} motion has stopped"
+	return [
+			name           : 'motion',
+			value          : value,
+			descriptionText: descriptionText,
+			translatable   : true
+	]
+}
+
+/**
+ * PING is used by Device-Watch in attempt to reach the Device
+ * */
+def ping() {
+    
+    log.debug "ping called"
+    
+    //set event to run again
+    runIn(60*27, ping)
+    
+    // Read the Battery Level and temperature and send check in command 
+    return zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0020) + 
+    		zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000) +
+            zigbee.command(0x0020, 0x00)
+            
+}
+
+def refresh() {
+	log.debug "refresh called"
+
+	def refreshCmds = zigbee.readAttribute(zigbee.POWER_CONFIGURATION_CLUSTER, 0x0020) +
+			zigbee.readAttribute(zigbee.TEMPERATURE_MEASUREMENT_CLUSTER, 0x0000)
+    
+    //set polling interval to 5 minutes + read attribute commands + zone enroll response command
+    return zigbee.enrollResponse() + refreshCmds + zigbee.command(0x0020, 0x02, "B0040000")
+}
+
+def configure() {
+	// Device-Watch allows 2 check-in misses from device
+	sendEvent(name: "checkInterval", value: 60 * 12, displayed: false, data: [protocol: "zigbee", hubHardwareId: device.hub.hardwareID])
+	
+    //setup event to read temperature and battery levels every 27 mins
+    runIn(60*27, ping)
+    
+    //configure check in interval
+    zigbee.writeAttribute(0x0020, 0x0000, 0x23, 0x00001950)
+    
+	// temperature minReportTime 5 min, maxReportTime 27 min. Reporting interval if no activity
+	// battery minReport 5 min, maxReportTime 27 min 
+	return zigbee.batteryConfig(300, 301) + zigbee.temperatureConfig(300, 301) + refresh()// send refresh cmds as part of config
+}
